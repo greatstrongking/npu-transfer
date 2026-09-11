@@ -1,0 +1,13 @@
+{
+	"permission": {
+		"read": "allow",
+		"bash": "allow",
+		"todowrite": "allow",
+		"glob": "allow",
+		"external_directory": "allow",
+		"edit": "allow",
+		"skill": "allow",
+		"rag-retrieval_rag_retrieval": "allow"
+	},
+	"$schema": "https://opencode.ai/config.json"
+}
