@@ -178,7 +178,8 @@ static ge::graphStatus NllLossTilingFunc(gert::TilingContext* context)
     }
 
     const int64_t availUb = std::max(static_cast<int64_t>(ubSize) - UB_RESERVE, static_cast<int64_t>(BLOCK_BYTES * 10));
-    const int64_t bufOverhead = BLOCK_BYTES * 10;
+    // 预留 ReduceSum workBuf(256B) 以及 Cast/Duplicate 最小 64 元素的 fp/valid buffer
+    const int64_t bufOverhead = BLOCK_BYTES * 10 + 2048;
     int64_t weightElems = AlignUp(std::max(cSize, blockElemsX), blockElemsX);
     int64_t weightBytes = weightElems * xBytes;
     const int64_t bytesPerNNormal = cSize * xBytes + tBytes + 2 * xBytes + 16;

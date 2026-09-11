@@ -16,6 +16,9 @@ using namespace AscendC;
 
 constexpr int32_t BLOCK_BYTES = 32;
 constexpr int32_t WS_FLOATS_PER_SLOT = 8;
+constexpr int32_t REDUCE_ALIGN_FLOAT = 8;
+constexpr int32_t MIN_VEC_ELEMS = 64;
+constexpr int32_t REDUCE_WORK_BYTES = 256;
 
 template <typename T, typename TargetT>
 class NllLoss {
@@ -42,6 +45,7 @@ private:
     __aicore__ inline void WaitVToS();
     __aicore__ inline void WaitVToMte3();
     __aicore__ inline void WaitSToMte3();
+    __aicore__ inline void WaitMte3ToV();
     __aicore__ inline void WritePartialToWorkspace();
     __aicore__ inline void ReduceAndWriteOutputs();
     __aicore__ inline void WriteScalarOut(GlobalTensor<T>& dst, float value, LocalTensor<T>& outLocal);
@@ -72,6 +76,8 @@ private:
     bool hasWeight_ = false;
     float localLoss_ = 0.0f;
     float localWeight_ = 0.0f;
+    int64_t validElems_ = 0;
+    int64_t fpElems_ = 0;
 };
 
 template <typename T, typename TargetT>
@@ -125,6 +131,14 @@ __aicore__ inline void NllLoss<T, TargetT>::WaitSToMte3()
 }
 
 template <typename T, typename TargetT>
+__aicore__ inline void NllLoss<T, TargetT>::WaitMte3ToV()
+{
+    event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+    SetFlag<HardEvent::MTE3_V>(eventId);
+    WaitFlag<HardEvent::MTE3_V>(eventId);
+}
+
+template <typename T, typename TargetT>
 __aicore__ inline void NllLoss<T, TargetT>::Init(
     GM_ADDR x, GM_ADDR target, GM_ADDR weight, GM_ADDR y, GM_ADDR totalWeight, GM_ADDR workspace,
     const NllLossTilingData* tilingData)
@@ -169,12 +183,41 @@ __aicore__ inline void NllLoss<T, TargetT>::InitBuffers()
     if (wBytes < BLOCK_BYTES) {
         wBytes = BLOCK_BYTES;
     }
+
+    // Gather Duplicate 按 32B 对齐后的 tileN 写入 validX/validW，不能小于 alignN * sizeof(T)
+    int64_t maxAlignN = AlignElems(tiling_->tileN, static_cast<int64_t>(sizeof(T)));
+    if (maxAlignN < MIN_VEC_ELEMS) {
+        maxAlignN = MIN_VEC_ELEMS;
+    }
+    int64_t requiredVBytes = maxAlignN * static_cast<int64_t>(sizeof(T));
+    if (vBytes < requiredVBytes) {
+        vBytes = requiredVBytes;
+    }
     if (vBytes < BLOCK_BYTES) {
         vBytes = BLOCK_BYTES;
+    }
+
+    // ReduceSum 的 count 至少按 8 个 float（32B）对齐，Cast 至少 64 元素
+    int64_t alignedTileN = ((tiling_->tileN + REDUCE_ALIGN_FLOAT - 1) / REDUCE_ALIGN_FLOAT) * REDUCE_ALIGN_FLOAT;
+    if (alignedTileN < MIN_VEC_ELEMS) {
+        alignedTileN = MIN_VEC_ELEMS;
+    }
+    int64_t requiredFpBytes = alignedTileN * static_cast<int64_t>(sizeof(float));
+    if (fpBytes < requiredFpBytes) {
+        fpBytes = requiredFpBytes;
     }
     if (fpBytes < BLOCK_BYTES) {
         fpBytes = BLOCK_BYTES;
     }
+
+    int64_t workBytes = fpBytes;
+    if (workBytes < REDUCE_WORK_BYTES) {
+        workBytes = REDUCE_WORK_BYTES;
+    }
+
+    validElems_ = vBytes / static_cast<int64_t>(sizeof(T));
+    fpElems_ = fpBytes / static_cast<int64_t>(sizeof(float));
+
     pipe.InitBuffer(xBuf, xBytes);
     pipe.InitBuffer(targetBuf, tBytes);
     pipe.InitBuffer(weightBuf, wBytes);
@@ -183,7 +226,7 @@ __aicore__ inline void NllLoss<T, TargetT>::InitBuffers()
     pipe.InitBuffer(fpXBuf, fpBytes);
     pipe.InitBuffer(fpWBuf, fpBytes);
     pipe.InitBuffer(tmpBuf, fpBytes);
-    pipe.InitBuffer(workBuf, fpBytes);
+    pipe.InitBuffer(workBuf, workBytes);
 }
 
 template <typename T, typename TargetT>
@@ -232,9 +275,8 @@ __aicore__ inline void NllLoss<T, TargetT>::GatherNormal(int64_t curN)
     LocalTensor<T> wLocal = weightBuf.Get<T>();
     LocalTensor<T> vx = validXBuf.Get<T>();
     LocalTensor<T> vw = validWBuf.Get<T>();
-    int64_t alignN = AlignElems(curN, static_cast<int64_t>(sizeof(T)));
-    Duplicate(vx, static_cast<T>(0), alignN);
-    Duplicate(vw, static_cast<T>(0), alignN);
+    Duplicate(vx, static_cast<T>(0), validElems_);
+    Duplicate(vw, static_cast<T>(0), validElems_);
     WaitVToS();
     WaitMte2ToS();
     for (int64_t i = 0; i < curN; ++i) {
@@ -262,9 +304,8 @@ __aicore__ inline void NllLoss<T, TargetT>::GatherLarge(int64_t nOffset, int64_t
     LocalTensor<T> wLocal = weightBuf.Get<T>();
     LocalTensor<T> vx = validXBuf.Get<T>();
     LocalTensor<T> vw = validWBuf.Get<T>();
-    int64_t alignN = AlignElems(curN, static_cast<int64_t>(sizeof(T)));
-    Duplicate(vx, static_cast<T>(0), alignN);
-    Duplicate(vw, static_cast<T>(0), alignN);
+    Duplicate(vx, static_cast<T>(0), validElems_);
+    Duplicate(vw, static_cast<T>(0), validElems_);
     WaitVToS();
     WaitMte2ToS();
     DataCopyExtParams oneX{1, static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
@@ -302,26 +343,49 @@ __aicore__ inline void NllLoss<T, TargetT>::ComputeTile(int64_t nOffset, int64_t
     LocalTensor<float> tmp = tmpBuf.Get<float>();
     LocalTensor<float> work = workBuf.Get<float>();
     int64_t calcN = AlignElems(curN, static_cast<int64_t>(sizeof(float)));
-
-    Duplicate(fpX, 0.0f, calcN);
-    Duplicate(fpW, 0.0f, calcN);
-    if constexpr (sizeof(T) == sizeof(float)) {
-        Muls(fpX, vx, static_cast<float>(-1), curN);
-        Mul(fpX, fpX, vw, curN);
-        Muls(fpW, vw, static_cast<float>(1), curN);
-    } else {
-        Cast(fpX, vx, RoundMode::CAST_NONE, curN);
-        Cast(fpW, vw, RoundMode::CAST_NONE, curN);
-        Muls(fpX, fpX, static_cast<float>(-1), curN);
-        Mul(fpX, fpX, fpW, curN);
+    if (calcN < REDUCE_ALIGN_FLOAT) {
+        calcN = REDUCE_ALIGN_FLOAT;
+    }
+    int64_t vecN = calcN;
+    if (vecN < MIN_VEC_ELEMS) {
+        vecN = MIN_VEC_ELEMS;
+    }
+    if (vecN > fpElems_) {
+        vecN = fpElems_;
+    }
+    if (vecN > validElems_) {
+        vecN = validElems_;
+    }
+    if (calcN > fpElems_) {
+        calcN = fpElems_;
     }
 
-    ReduceSum(tmp, fpX, work, curN);
+    Duplicate(fpX, 0.0f, fpElems_);
+    Duplicate(fpW, 0.0f, fpElems_);
+    if constexpr (sizeof(T) == sizeof(float)) {
+        Muls(fpX, vx, static_cast<float>(-1), vecN);
+        Mul(fpX, fpX, vw, vecN);
+        Muls(fpW, vw, static_cast<float>(1), vecN);
+    } else {
+        Cast(fpX, vx, RoundMode::CAST_NONE, vecN);
+        Cast(fpW, vw, RoundMode::CAST_NONE, vecN);
+        Muls(fpX, fpX, static_cast<float>(-1), vecN);
+        Mul(fpX, fpX, fpW, vecN);
+    }
+
+    int64_t reduceN = calcN;
+    if (reduceN < REDUCE_ALIGN_FLOAT) {
+        reduceN = REDUCE_ALIGN_FLOAT;
+    }
+    if (reduceN > fpElems_) {
+        reduceN = fpElems_;
+    }
+    ReduceSum(tmp, fpX, work, reduceN);
     WaitVToS();
     localLoss_ += tmp.GetValue(0);
 
     WaitSToV();
-    ReduceSum(tmp, fpW, work, curN);
+    ReduceSum(tmp, fpW, work, reduceN);
     WaitVToS();
     localWeight_ += tmp.GetValue(0);
 
@@ -332,7 +396,7 @@ __aicore__ inline void NllLoss<T, TargetT>::ComputeTile(int64_t nOffset, int64_t
             DataCopyPad(yGM[nOffset], fpX, params);
         } else {
             WaitSToV();
-            Cast(vx, fpX, RoundMode::CAST_RINT, curN);
+            Cast(vx, fpX, RoundMode::CAST_RINT, vecN);
             WaitVToMte3();
             CopyOutY(nOffset, curN);
         }
@@ -359,19 +423,21 @@ template <typename T, typename TargetT>
 __aicore__ inline void NllLoss<T, TargetT>::WritePartialToWorkspace()
 {
     LocalTensor<float> tmp = tmpBuf.Get<float>();
-    Duplicate(tmp, 0.0f, WS_FLOATS_PER_SLOT);
+    Duplicate(tmp, 0.0f, fpElems_);
     WaitVToS();
     tmp.SetValue(0, localLoss_);
     WaitSToMte3();
     DataCopyExtParams params{1, static_cast<uint32_t>(BLOCK_BYTES), 0, 0, 0};
     DataCopyPad(wsGM[blockIdx_ * WS_FLOATS_PER_SLOT], tmp, params);
+    WaitMte3ToV();
 
-    Duplicate(tmp, 0.0f, WS_FLOATS_PER_SLOT);
+    Duplicate(tmp, 0.0f, fpElems_);
     WaitVToS();
     tmp.SetValue(0, localWeight_);
     WaitSToMte3();
     int64_t wBase = tiling_->needCoreNum * WS_FLOATS_PER_SLOT;
     DataCopyPad(wsGM[wBase + blockIdx_ * WS_FLOATS_PER_SLOT], tmp, params);
+    WaitMte3ToV();
 }
 
 template <typename T, typename TargetT>
@@ -379,7 +445,7 @@ __aicore__ inline void NllLoss<T, TargetT>::WriteScalarOut(
     GlobalTensor<T>& dst, float value, LocalTensor<T>& outLocal)
 {
     LocalTensor<float> tmp = tmpBuf.Get<float>();
-    Duplicate(tmp, 0.0f, WS_FLOATS_PER_SLOT);
+    Duplicate(tmp, 0.0f, fpElems_);
     WaitVToS();
     tmp.SetValue(0, value);
     if constexpr (sizeof(T) == sizeof(float)) {
@@ -387,7 +453,11 @@ __aicore__ inline void NllLoss<T, TargetT>::WriteScalarOut(
         WaitSToMte3();
     } else {
         WaitSToV();
-        Cast(outLocal, tmp, RoundMode::CAST_RINT, WS_FLOATS_PER_SLOT);
+        int64_t castN = fpElems_;
+        if (castN > validElems_) {
+            castN = validElems_;
+        }
+        Cast(outLocal, tmp, RoundMode::CAST_RINT, castN);
         WaitVToMte3();
     }
     DataCopyExtParams outParams{1, static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
