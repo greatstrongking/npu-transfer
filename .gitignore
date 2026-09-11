@@ -1,1 +1,8 @@
 build/
+tests/ut/op_kernel/nll_loss_data/float16_golden_nll_loss_0.bin
+tests/ut/op_kernel/nll_loss_data/float16_golden_nll_loss_1.bin
+tests/ut/op_kernel/nll_loss_data/float16_input_nll_loss_weight.bin
+tests/ut/op_kernel/nll_loss_data/float16_input_nll_loss_target.bin
+tests/ut/op_kernel/nll_loss_data/float16_input_nll_loss_x.bin
+tests/ut/op_kernel/nll_loss_data/float16_output_nll_loss_0.bin
+tests/ut/op_kernel/nll_loss_data/float16_output_nll_loss_1.bin
